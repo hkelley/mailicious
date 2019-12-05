@@ -1,6 +1,6 @@
 param 
-(
-      [Parameter(Mandatory = $true)] [string] $MailboxName 
+(     
+      [Parameter(Mandatory = $false)] [string] $ConfigFile = $null
     , [Parameter(Mandatory = $false)] [System.Net.NetworkCredential] $AdminCred
     , [Parameter(Mandatory = $false)] [string] $FolderInName = "Inbox"
     , [Parameter(Mandatory = $false)] [string] $FolderFinalName = "Incoming-Completed"
@@ -9,10 +9,6 @@ param
     , [Parameter(Mandatory = $false)] [switch] $SkipTrace
     , [Parameter(Mandatory = $false)] [string] $TraceFile
     , [Parameter(Mandatory = $false)] [string[]] $IgnoredMailboxesInTrace 
-    , [Parameter(Mandatory = $false)] [string] $splunkHEC = 
-    , [Parameter(Mandatory = $false)] [string] $splunkHECToken = 
-    , [Parameter(Mandatory = $false)] [string] $splunkIndex = "userevents"
-    , [Parameter(Mandatory = $false)] [string] $splunkSourcetype = "maliciousmail:userreported"
     , [Parameter(Mandatory = $false)] [int] $traceWindowHours = 12
     , [Parameter(Mandatory = $false)] [string[]] $IgnoredURLs = ("http://schemas.microsoft.com/office/2004/12/omml", "http://www.w3.org/tr/rec-html40")
 
@@ -96,6 +92,9 @@ Function AnalyzeItem($itemToAnalyze)
     }
     elseif ($itemToAnalyze.ContentType -notlike "message/*")   # file attachments
     {
+        # this isn't a  message so add to attachments indicators list
+        $script:attachments += $itemToAnalyze.Name
+
         if ($itemToAnalyze.Name -like "*.htm*" )
         {
             # HTML attachments
@@ -108,13 +107,18 @@ Function AnalyzeItem($itemToAnalyze)
             $emlAttachment = ConvertEmlToCdo( $itemToAnalyze )
             $body =  $emlAttachment.TextBody 
         }
-        elseif ($itemToAnalyze.Name -like "*.pdf" -or $itemToAnalyze.ContentType -like "application/*")
+        elseif ($itemToAnalyze.Name -like "*.pdf" )
         {
             # PDFs
         }
-
-        # this wasn't a real message so assume it was an attachment
-        $script:attachments += $itemToAnalyze.Name
+        elseif ($itemToAnalyze.Name -like "*.doc?" )
+        {
+            # save file to disk,  dump URLs,  discard
+        }
+        elseif ($itemToAnalyze.ContentType -like "application/*")
+        {
+            # develop steps for this?
+        }
     }
 
     # if this is a message object with attachments then recursively analyze those
@@ -164,11 +168,17 @@ $removed = $null
 $lib = "$PSScriptRoot\microsoft.exchange.webservices.dll"
 Add-Type -Path ($lib) 
 
+if($ConfigFile -eq $null -or $ConfigFile.Trim().Length -eq 0)
+{
+    $ConfigFile = ("{0}.config" -f $MyInvocation.InvocationName)
+}
+$config = Get-Content $ConfigFile | ConvertFrom-Json
+
 #Connect to Exchange Web Service
 $Service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1)
 if($UseImpersonation)
 {
-    $Service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $MailboxName)
+    $Service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $config.mailboxName)
 }
 
 if($AdminCred -ne $null)
@@ -184,16 +194,17 @@ TD {border-width: 1px; padding: 3px; border-style: solid; border-color: black;}
 </style>
 "@
 
-$Service.AutodiscoverUrl($MailboxName,{$true})
+$Service.AutodiscoverUrl($config.mailboxName,{$true})
 
 #Fetch IDs of Well-known folders
-$RootFolderID = New-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot, (New-Object Microsoft.Exchange.WebServices.Data.Mailbox( $MailboxName)))
+$RootFolderID = New-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot, (New-Object Microsoft.Exchange.WebServices.Data.Mailbox( $config.mailboxName)))
 $RootFolder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($Service,$RootFolderID)
-#$InboxFolderID = New-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Inbox, (New-Object Microsoft.Exchange.WebServices.Data.Mailbox( $MailboxName)))
-$DraftsFolder = New-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Drafts, (New-Object Microsoft.Exchange.WebServices.Data.Mailbox( $MailboxName)))
+$DraftsFolder = New-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Drafts, (New-Object Microsoft.Exchange.WebServices.Data.Mailbox( $config.mailboxName)))
 
 if($RootFolder -eq $null)
-{  Throw "Could not connect to Root folder of $MailboxName"  }
+{
+      Throw ("Could not connect to Root folder of {0}" -f $config.mailboxName  )
+}
 
 #Create a Folder View
 $FolderView = New-Object Microsoft.Exchange.WebServices.Data.FolderView(1000)
@@ -269,8 +280,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         $receivedSPF
         $authResults
 
-        Write-Host 
-
+        Write-Host ""
 
         ## URL review
         # Analyst picks URLs
@@ -422,7 +432,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                     {
                         # https://docs.microsoft.com/en-us/exchange/security-and-compliance/in-place-ediscovery/message-properties-and-search-operators
                         $query = "subject:`"{0}`" from:{1} received:{2:d}"  -f $msgGroup.group[0].subject,$msgGroup.group[0].SenderAddress,[DateTime]::Parse($msgGroup.group[0].Received)  # 
-                        $result = Search-OnPremMailbox -Identity  $msgGroup.Name -SearchQuery $query  -LogLevel:Full -TargetMailbox $mailboxName -TargetFolder $logtoFolder -DeleteContent -Force 
+                        $result = Search-OnPremMailbox -Identity  $msgGroup.Name -SearchQuery $query  -LogLevel:Full -TargetMailbox $config.mailboxName -TargetFolder $logtoFolder -DeleteContent -Force 
                         $removed += $result.ResultItemsCount
                     }
                 }
@@ -497,26 +507,28 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
     $submission.Update([Microsoft.Exchange.WebServices.Data.ConflictResolutionMode]::AutoResolve)
     [VOID] $submission.Move($FolderFinal.ID)
 
-    $splunkHeaders = @{Authorization = "Splunk $splunkHECToken"}
-    $splunkHecUrl = "https://$splunkHEC/services/collector/event"
-    $splunkSource = $($MyInvocation.MyCommand).ToString()
-
-
-    # the Splunk payload
-    $splunkData = [pscustomobject] @{
-        index = $splunkIndex
-        sourcetype = $splunkSourcetype
-        host = $env:COMPUTERNAME
-        source = $splunkSource
-        time = (New-TimeSpan -Start (Get-Date "1970-01-01T00:00:00Z").ToUniversalTime() -End (Get-Date ).ToUniversalTime()).TotalSeconds
-        event = $summary 
-    } 
-
-    $payload = ($splunkData | ConvertTo-Json -Depth 5) -replace "\\u003c","<" -replace "\\u003e",">"  # un-escape some JSON escaping for human clarity
-            
-    $result = Invoke-RestMethod -Uri $splunkHecUrl -Method Post -Headers $splunkHeaders -Body $payload
-    if($result.text -eq "Success")
+    if($config.splunkHECToken -ne $null -and $config.splunkHECToken.trim() -gt "")
     {
-        Write-Host "logged to Splunk"
+        $splunkHeaders = @{Authorization = ("Splunk {0}" -f $config.splunkHECToken)}
+        $splunkHecUrl = "https://{0}/services/collector/event" -f $config.splunkHEC
+        $splunkSource = $($MyInvocation.MyCommand).ToString()
+
+        # the Splunk payload
+        $splunkData = [pscustomobject] @{
+            index = $config.splunkIndex
+            sourcetype = $config.splunkSourcetype
+            host = $env:COMPUTERNAME
+            source = $splunkSource
+            time = (New-TimeSpan -Start (Get-Date "1970-01-01T00:00:00Z").ToUniversalTime() -End (Get-Date ).ToUniversalTime()).TotalSeconds
+            event = $summary 
+        } 
+
+        $payload = ($splunkData | ConvertTo-Json -Depth 5) -replace "\\u003c","<" -replace "\\u003e",">"  # un-escape some JSON escaping for human clarity
+            
+        $result = Invoke-RestMethod -Uri $splunkHecUrl -Method Post -Headers $splunkHeaders -Body $payload
+        if($result.text -eq "Success")
+        {
+            Write-Host "logged to Splunk"
+        }
     }
 }
