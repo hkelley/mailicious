@@ -83,9 +83,7 @@ Function AnalyzeItem($itemToAnalyze)
             $script:authResults = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results").Value
             $script:receivedSPF = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:received-spf").Value
         }
-
     }
-
     elseif ($itemToAnalyze.InternetMessageHeaders -ne $null) # simple FW: message
     {
         $script:internetMessageId = $itemToAnalyze.InternetMessageHeaders.Find("References").value
@@ -99,7 +97,6 @@ Function AnalyzeItem($itemToAnalyze)
         {
             # HTML attachments
             $body = [System.Text.Encoding]::UTF8.GetString($itemToAnalyze.Content)
-
         }
         elseif ($itemToAnalyze.ContentType -eq "application/octet-stream" -and ($itemToAnalyze.Name -like "*.eml" -or $itemToAnalyze.Name -like "*.msg"))
         {                  
@@ -131,7 +128,6 @@ Function AnalyzeItem($itemToAnalyze)
         }
     }
 
-
     # Body extraction logic here - need to further refactor
     if($body -eq $null)
     {
@@ -152,14 +148,6 @@ Function AnalyzeItem($itemToAnalyze)
 
     $script:urls += ExtractLinks ($body)
 }
-
-
-#  variable init
-$traces = @()  # force array -  use the append (+=) operator below to maintain array
-$msgGroups = @()
-$msgGroupsByID = @()
-$fromIPs = @()
-$removed = $null
 
 # Load cmdlets needed for Exchange on-prem and O365 interaction
 & $PSScriptRoot\Import-Exchange-Cmdlets.ps1
@@ -238,18 +226,22 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
 
 :submission foreach($submission in $service.FindItems($folderPickup.Id, $sfUnread, $itemview))
 {
+    #  variable init
+    $traces = @()  # force array -  use the append (+=) operator below to maintain array
+    $msgGroups = @()
+    $msgGroupsByID = @()
+    $fromIPs = @()
+    $removed = $null
+    $reportedMessage = $null # this will be the "carrier" message that actually came to the user
+    $itemsToAnalyze = @()       # One submission may have multiple (including nested) attachments
+    # arrays to hold indicators from the reported message
+    $urls = @()
+    $attachments = @()
+
     $submission.Load()  # this is the message we received from the reporting user
 
-    $reportedMessage = $null # this will be the "carrier" message that actually came to the user
-
-    # One submission may have multiple (including nested) attachments
-    $itemsToAnalyze = @()
     try 
     {
-        # arrays to hold indicators from the reported message
-        $urls = @()
-        $attachments = @()
-
         $itemsToAnalyze += $submission.Attachments | ?{$_.IsInline -ne $true -or $_.GetType().FullName -eq "Microsoft.Exchange.WebServices.Data.EmailMessage"}
     
         # if no attachements found, analyze this message
@@ -262,7 +254,6 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         :itemtoanalyze foreach($itemToAnalyze in $itemsToAnalyze | ?{$_.IsInline -ne $true} )   # weird negation to handle nulls
         {
             AnalyzeItem $itemToAnalyze
-
         }
 
         #  if no message ID could be found, take the base message
@@ -270,24 +261,25 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         {
             $reportedMessage = $submission
         }
-
         
-        ## SPF review
+        ## SPF review by analyst
         Write-Warning  "Sender authentication results"
         "Subject:  {0}" -f $reportedMessage.Subject
         "Sender:  {0}" -f $reportedMessage.From
-        "MessageID:  {0}" -f $internetMessageID
-        $receivedSPF
-        $authResults
+        "MessageID:  {0}" -f $internetMessageID        
+        Write-Warning  "received-spf:"
+        $receivedSPF -split ";"
+        Write-Warning  "Authentication-Results:"
+        $authResults -split ";"
 
         Write-Host ""
 
-        ## URL review
+        ## URL review by analyst
         # Analyst picks URLs
         if($urls.Count -gt 0)
         {
             Write-Warning ("URLs found: ")
-#            $urls  -replace "^http","hXXp" | % {$index=0} {$_; $index++} | Format-Table -Property @{ Label="index";Expression={$index}; Width=5 },*
+
             $urlTable = @()
             for($tableIdx=0; $tableIdx -lt $urls.Count; $tableIdx++) 
             {
@@ -328,9 +320,8 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         }
         else
         {
-                Write-Host "No URLs found`r`n"  -ForegroundColor Yellow
+            Write-Host "No URLs found`r`n"  -ForegroundColor Yellow
         }
-
 
         ## Tracing
         if($SkipTrace)
@@ -347,7 +338,6 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                 $traces = Import-Csv -Path $TraceFile
 
                 $senderAddr = $traces[0].SenderAddress.ToLower()
-
             }
             else
             {
@@ -364,14 +354,12 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
 
                     $senderAddr = $traceInitialReport.SenderAddress.ToLower()
 
-
-                    # Now search for similar messages.
+                    # Now search for similar messages from this sender
                     # Try to handle any wackiness in timestamps but still do a time-ranged search for good performance
 
                     #  Trace for all messages +/- n hours of initial delivery
                     $traces += Get-O365MessageTrace  -SenderAddress $senderAddr  -StartDate $traceInitialReport.Received.AddHours(-1 * $traceWindowHours) -EndDate $traceInitialReport.Received.AddHours($traceWindowHours) -Status Quarantined,Delivered -ErrorAction Stop  `
-                        | ?{$IgnoredMailboxesInTrace -notcontains $_.RecipientAddress -and $_.Subject -eq $reportedMessage.Subject }
-                    
+                        | ?{$IgnoredMailboxesInTrace -notcontains $_.RecipientAddress -and $_.Subject -eq $reportedMessage.Subject }                    
                 }
                 catch
                 {
@@ -391,18 +379,17 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                 $reportedMessage | fl *
 
                 $senderAddr = "#find in authentication header#"
-                $fromIP = "#find in authentication header#"
+                $fromIPs = "#find in authentication header#"
             }
             else
             {
-
-                $msgGroups = $traces | Group-Object RecipientAddress
+                $fromIPs = @($traces | Select-Object -Unique -ExpandProperty FromIP )
+                $msgGroupsByRecip = $traces | Group-Object RecipientAddress
                 $msgGroupsByID = $traces | Group-Object MessageID
 
                 Write-Host ("Trace completed,   found {0}" -f $traces.count )   -ForegroundColor Yellow
 
                 $traces | format-table  Received,SenderAddress,RecipientAddress,Subject,Status,MessageID
-                $removed = 0
 
                 Write-Host "Remove Matching Messages? [y/n]?" -ForegroundColor Yellow -NoNewline             
                 if ( ($response = Read-Host ) -notmatch "[yY]" ) 
@@ -417,10 +404,8 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                         continue submission
                     }
                 }
-                else
-                {
-                    # Otherwise,  run the remove messages from mailboxes and quarantine
-
+                else  # Otherwise,  run the remove messages from mailboxes and quarantine
+                {                   
                     foreach($group in $msgGroupsByID)
                     {
                         $quarantines = @(Get-O365QuarantineMessage -MessageId $group.Name)
@@ -428,20 +413,48 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                         $removed += $quarantines.count
                     }
 
-                    foreach($msgGroup in $msgGroups)
+                    foreach($msgGroup in $msgGroupsByRecip)
+                    {  
+                        # keep the removal search matching the tracing search   #Don't use   subject:`"{0}`" 
+                        $query = "from:{1} received:{2:d}"  -f $msgGroup.group[0].subject,$msgGroup.group[0].SenderAddress,[DateTime]::Parse($msgGroup.group[0].Received)
+                        $complianceSearchMbxs = @()
+
+                        if(($recipient = Get-O365Recipient -Identity $msgGroup.Name) -and $recipient.RecipientType -eq "MailUser")
+                        {
+                            # Use the old-fashioned (and simple) Search-Mailbox cmdlet for each on-prem mailboxes
+                            $result = Search-OnPremMailbox -Identity  $msgGroup.Name -SearchQuery $query  -LogLevel:Full -TargetMailbox $config.mailboxName -TargetFolder $logtoFolder -DeleteContent -Force 
+                            $removed += $result.ResultItemsCount
+                        }
+                        elseif($recipient.RecipientType -like "*Mailbox")
+                        {
+                            $complianceSearchMbxs += $msgGroup.Name
+                        }
+                    }
+
+                    # Use the modern/annoying ComplianceSearch cmdlets for online mailboxes.
+                    if($complianceSearchMbxs.Count -gt 0)
                     {
-                        # https://docs.microsoft.com/en-us/exchange/security-and-compliance/in-place-ediscovery/message-properties-and-search-operators
-                        $query = "subject:`"{0}`" from:{1} received:{2:d}"  -f $msgGroup.group[0].subject,$msgGroup.group[0].SenderAddress,[DateTime]::Parse($msgGroup.group[0].Received)  # 
-                        $result = Search-OnPremMailbox -Identity  $msgGroup.Name -SearchQuery $query  -LogLevel:Full -TargetMailbox $config.mailboxName -TargetFolder $logtoFolder -DeleteContent -Force 
-                        $removed += $result.ResultItemsCount
+                        $searchName = "{0}/{1}" -f $submission.From.Address,$internetMessageId
+                        $searchName = $searchName -replace "<|>",""  # strip invalid characters
+
+                        New-ComplianceSearch -Name $searchName -ExchangeLocation $complianceSearchMbxs -ContentMatchQuery $query 
+                        Start-ComplianceSearch -Identity $searchName
+
+                        $search = Get-ComplianceSearch -Identity $searchName
+                        do
+                        {
+                            Write-Host ("Search is {0}" -f $search.Status)
+                            Start-Sleep -Seconds 2
+                                   
+                        } while(($search = Get-ComplianceSearch -Identity $searchName ) -and $search.Status -ne "Completed")
+
+                        $removed +=  $stats.ExchangeBinding.Search.ContentItems
                     }
                 }
-
-                $fromIPs = @($trace | Select-Object -Unique -ExpandProperty FromIP )
             }
         }
 
-
+        # the object to report
         $summary = [pscustomobject] @{
             Subject=$reportedMessage.Subject
             FromAddr=$reportedMessage.From #-replace '[^\p{L}\p{Nd}/(/}/_]', ''  # https://lazywinadmin.com/2015/08/powershell-remove-special-characters.html
@@ -449,9 +462,9 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
             SenderAddr=$senderAddr
             Attachments=$attachments -join "LINE_BREAK"
             URLs=($urls -join "LINE_BREAK" ) -replace "http","hXXp"
-            ReceivedUTC="{0:o}" -f $reportedMessage.ReceivedTime.ToUniversalTime() # why did I use this ? -->> [DateTime]::Parse($msgGroups[0].Group.Received)
+            ReceivedUTC="{0:o}" -f $reportedMessage.ReceivedTime.ToUniversalTime() # why did I use this ? -->> [DateTime]::Parse($msgGroupsByRecip[0].Group.Received)
             ReportedUTC="{0:o}" -f $submission.DateTimeSent.ToUniversalTime()
-            RecipientCount=$msgGroups.Count
+            RecipientCount=$msgGroupsByRecip.Count
             MessagesRemoved=$removed
             ReportedMessageID=$internetMessageId
             ReceivedSPF=$receivedSPF
@@ -478,18 +491,14 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
 
         # We don't show the full recipient list to the reporting user but do show it to the analyst and add it to the Splunk event
         Write-Host "Full Recipient List"
-        $msgGroups.Name -join ";"
-        $summary | Add-Member -NotePropertyName "Recipients" -NotePropertyValue @($msgGroups.Name)  # force to array
+        $msgGroupsByRecip.Name -join ";"
+        $summary | Add-Member -NotePropertyName "Recipients" -NotePropertyValue @($msgGroupsByRecip.Name)  # force to array
         $summary | Add-Member -NotePropertyName "MessageIDs" -NotePropertyValue @($msgGroupsByID.Name)
         $summary | Add-Member -NotePropertyName "FromIPs" -NotePropertyValue $fromIPs
         $summary | Add-Member -NotePropertyName "Analyst" -NotePropertyValue $(whoami.exe /upn)
-
-
-
     }
     catch 
     {        
-
         $submission.IsRead = $false
         $submission.Update([Microsoft.Exchange.WebServices.Data.ConflictResolutionMode]::AutoResolve)
 
@@ -500,8 +509,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         $Error[0].Exception.InnerException
 
         continue submission
-    }   
-
+    }
 
     $submission.IsRead = $true
     $submission.Update([Microsoft.Exchange.WebServices.Data.ConflictResolutionMode]::AutoResolve)
