@@ -95,7 +95,13 @@ Function AnalyzeItem($itemToAnalyze)
             $script:reportedMessage = $itemToAnalyze   # this is probably the "root" message
          
             $script:internetMessageId = $itemToAnalyze.InternetMessageId
-            $script:authResults = $itemToAnalyze.InternetMessageHeaders.Find("Authentication-Results")             
+
+            # Get the "upstream-most" SPF
+            if(!($auth = $itemToAnalyze.InternetMessageHeaders.Find("Authentication-Results-Original")))
+            {
+                $auth = $itemToAnalyze.InternetMessageHeaders.Find("Authentication-Results")             
+            }
+            $script:authResults = $auth
             $script:receivedSPF = $itemToAnalyze.InternetMessageHeaders.Find("Received-SPF")
             
             foreach($h in $LoggedHeaders)
@@ -116,7 +122,14 @@ Function AnalyzeItem($itemToAnalyze)
             $script:reportedMessage = $itemToAnalyze   # this is probably the "root" message
 
             $script:internetMessageId = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:message-id").Value
-            $script:authResults = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results").Value
+
+            # Get the "upstream-most" SPF
+            if(!($auth = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results-original").Value))
+            {
+                $auth = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results").Value
+            }
+            $script:authResults = $auth            
+            
             $script:receivedSPF = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:received-spf").Value
 
             foreach($h in $LoggedHeaders)
