@@ -11,8 +11,34 @@ param
     , [Parameter(Mandatory = $false)] [string[]] $IgnoredMailboxesInTrace 
     , [Parameter(Mandatory = $false)] [int] $traceWindowHours = 12
     , [Parameter(Mandatory = $false)] [string[]] $IgnoredURLs = ("http://schemas.microsoft.com/office/2004/12/omml", "http://www.w3.org/tr/rec-html40")
-
+    , [Parameter(Mandatory = $false)] [string[]] $LoggedHeaders = ("X-Proofpoint-Spam-Details")
 )
+
+
+Function DecodeUrls ($encodedUrls)
+{
+    # convert to HT for tracking
+    $urls = @{} 
+    $encodedUrls | %{$urls[$_] = $_}
+
+    if($ppKeys = $urls.Keys | ?{$_ -like "https://urldefense.com/v3/*"})
+    {
+        $proofpointApiUrl = "https://tap-api-v2.proofpoint.com/v2/url/decode"
+    
+        $reqbody = [pscustomobject] @{
+                urls = @($ppKeys)
+            } | ConvertTo-Json
+
+        $result = Invoke-RestMethod -Method Post -ContentType "application/json" -Uri $proofpointApiUrl -Body $reqbody
+
+        foreach($r in $result.urls | ?{$_.success -eq "True"})
+        {
+            $urls[$r.encodedUrl] =  $r.decodedUrl
+        }
+    }
+
+    return ($urls.Values | Select-Object -Unique)
+}
 
 Function ConvertEmlToCdo ($EmlItem)
 {
@@ -31,15 +57,18 @@ Function ExtractLinks($body)
 {
     $foundurls = @()
 
-    foreach($link in [regex]::matches($body, '(www|http:|https:)[^\s^"]+[\w]') ) 
+    foreach($link in [regex]::matches($body, '(www|http:|https:)[^\s^"]+[\w\$]') ) 
     {
-        $link = $link.Value.ToLower().Trim()
+        $link = $link.Value.Trim()
         if( !($foundurls.Contains($link)) -and !($IgnoredURLs.Contains($link)))
         {
             $foundurls += $link
         }
     }
-    return $foundurls
+
+    $decodedUrls = DecodeUrls $foundurls
+
+    return $decodedUrls
 }
 
 Function AnalyzeItem($itemToAnalyze)
@@ -61,15 +90,22 @@ Function AnalyzeItem($itemToAnalyze)
         # Outlook dragged-in attachment 
         $itemToAnalyze =  $itemToAnalyze.Item                # dereference
 
-        if($itemToAnalyze.SentOn -ne $null)
+        if($itemToAnalyze.DateTimeSent -ne $null)
         {
             $script:reportedMessage = $itemToAnalyze   # this is probably the "root" message
          
             $script:internetMessageId = $itemToAnalyze.InternetMessageId
             $script:authResults = $itemToAnalyze.InternetMessageHeaders.Find("Authentication-Results")             
             $script:receivedSPF = $itemToAnalyze.InternetMessageHeaders.Find("Received-SPF")
+            
+            foreach($h in $LoggedHeaders)
+            {
+                if($val = $itemToAnalyze.InternetMessageHeaders.Find($h).Value)
+                {                
+                    $script:additionalHeaders[$h] = $val
+                }
+            }
         }
-
     }
     elseif ($itemToAnalyze.ContentType -eq "message/rfc822")    
     {
@@ -82,6 +118,14 @@ Function AnalyzeItem($itemToAnalyze)
             $script:internetMessageId = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:message-id").Value
             $script:authResults = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results").Value
             $script:receivedSPF = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:received-spf").Value
+
+            foreach($h in $LoggedHeaders)
+            {
+                if($val = $itemToAnalyze.Fields.Item(("urn:schemas:mailheader:{0}" -f $h)).Value)
+                {
+                    $script:additionalHeaders[$h] = $val
+                }
+            }
         }
     }
     elseif ($itemToAnalyze.InternetMessageHeaders -ne $null) # simple FW: message
@@ -237,6 +281,8 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
     # arrays to hold indicators from the reported message
     $urls = @()
     $attachments = @()
+    $additionalHeaders = @{}
+
 
     $submission.Load()  # this is the message we received from the reporting user
 
@@ -271,6 +317,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         $receivedSPF -split ";"
         Write-Warning  "Authentication-Results:"
         $authResults -split ";"
+
 
         Write-Host ""
 
@@ -485,6 +532,11 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         # reformat the attachments and URLs properties (now that we're finished with HTML display for the user)
         $summary.Attachments= $attachments
         $summary.URLs = @($urls)
+
+        foreach($h in $additionalHeaders.Keys)
+        {
+            $summary | Add-Member -NotePropertyName $h -NotePropertyValue $additionalHeaders[$h]
+        }
 
         # Display for the analyst
         $summary | fl *
