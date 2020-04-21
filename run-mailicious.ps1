@@ -258,11 +258,18 @@ else  # MSAL
     $lib = "$PSScriptRoot\Microsoft.Identity.Client.dll"
     Add-Type -Path ($lib) 
 
-    # https://gsexdev.blogspot.com/2019/10/using-msal-microsoft-authentication.html    
-    $pcaConfig = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($ClientId).WithTenantId($TenantId).WithRedirectUri($redirectUri)
+    # https://gsexdev.blogspot.com/2019/10/using-msal-microsoft-authentication.html 
+    $ewsScopes = New-Object System.Collections.Generic.List[string]
+    $ewsScopes.Add("https://outlook.office.com/EWS.AccessAsUser.All")
+   
+    $pcaConfig = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($config.azureClientId).WithTenantId($config.azureTenantId).WithRedirectUri($config.azureRedirectUri)
 
     # can't use "never" if the users hasn't already accepted the prompt.
-    $tokenResult = $pcaConfig.Build().AcquireTokenInteractive($Scopes).WithPrompt([Microsoft.Identity.Client.Prompt]::NoPrompt).WithLoginHint($MailboxName).ExecuteAsync().Result;
+    if(!($tokenResult = $pcaConfig.Build().AcquireTokenInteractive($ewsScopes).WithPrompt([Microsoft.Identity.Client.Prompt]::NoPrompt).WithLoginHint($MailboxName).ExecuteAsync().Result))
+    {
+        throw "Unable to authenticate to Office 365"
+        exit
+    }
 
     # https://docs.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-authenticate-an-ews-application-by-using-oauth
     $service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials( $tokenResult.AccessToken)
