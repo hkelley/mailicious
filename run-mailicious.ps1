@@ -4,7 +4,7 @@ param
     , [Parameter(Mandatory = $false)] [System.Net.NetworkCredential] $AdminCred
     , [Parameter(Mandatory = $false)] [string] $FolderInName = "Inbox"
     , [Parameter(Mandatory = $false)] [string] $FolderFinalName = "Incoming-Completed"
-    , [Parameter(Mandatory = $false)] [string] $logtoFolder  = ("Recalls {0:yyyy-MM}" -f (Get-Date).ToUniversalTime())
+# removed - didn't work well for hybrid topology    , [Parameter(Mandatory = $false)] [string] $logtoFolder  = ("Recalls {0:yyyy-MM}" -f (Get-Date).ToUniversalTime())
     , [Parameter(Mandatory = $false)] [switch] $UseImpersonation
     , [Parameter(Mandatory = $false)] [switch] $SkipTrace
     , [Parameter(Mandatory = $false)] [string] $TraceFile
@@ -42,14 +42,30 @@ Function DecodeUrls ($encodedUrls)
 
 Function ConvertEmlToCdo ($EmlItem)
 {
-    $msgString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($emlItem.Content)
-    $cdoMsg = New-Object -ComObject CDO.Message
-    $cdomsgstream = $cdoMsg.GetStream()
-    $cdomsgstream.WriteText($msgString)
-    $cdomsgstream.Flush()
-    $cdomsgstream.Close()
+    try
+    {
+        $msgString = [System.Text.Encoding]::GetEncoding("ISO-8859-1").GetString($emlItem.Content)
+        $cdoMsg = New-Object -ComObject CDO.Message
+        $cdomsgstream = $cdoMsg.GetStream()
+        $cdomsgstream.WriteText($msgString)
+        $cdomsgstream.Flush()
+        $cdomsgstream.Close()
 
-    return $cdoMsg
+        #if we have a message ID then this must be a real email
+        if($cdoMsg.Fields.Item("urn:schemas:mailheader:message-id") -ne $null)
+        {
+            return $cdoMsg
+        }
+        else
+        {
+            throw "not an EML"
+        }
+    }
+    catch
+    {
+        Write-Warning $_
+        return $null
+    }
 }
 
 
@@ -102,7 +118,8 @@ Function AnalyzeItem($itemToAnalyze)
                 $auth = $itemToAnalyze.InternetMessageHeaders.Find("Authentication-Results")             
             }
             $script:authResults = $auth
-            $script:receivedSPF = $itemToAnalyze.InternetMessageHeaders.Find("Received-SPF")
+#            $script:receivedSPF = $itemToAnalyze.InternetMessageHeaders.Find("Received-SPF")
+            $script:xOriginatingIp = $itemToAnalyze.InternetMessageHeaders.Find("x-originating-ip").Value -replace "\[|\]","" 
             
             foreach($h in $LoggedHeaders)
             {
@@ -113,28 +130,29 @@ Function AnalyzeItem($itemToAnalyze)
             }
         }
     }
-    elseif ($itemToAnalyze.ContentType -eq "message/rfc822")    
+    elseif (($itemToAnalyze.ContentType -eq "message/rfc822" -or $itemToAnalyze.Name -like "*.eml" ) `
+            -and ($eml = ConvertEmlToCdo $itemToAnalyze)) 
     {
-        # eml file 
-        $itemToAnalyze = ConvertEmlToCdo $itemToAnalyze
-        if($itemToAnalyze.SentOn -ne $null)
+        #eml file 
+        
+        if($eml.SentOn -ne $null)
         {
-            $script:reportedMessage = $itemToAnalyze   # this is probably the "root" message
+            $script:reportedMessage = $eml   # this is probably the "root" message
 
-            $script:internetMessageId = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:message-id").Value
+            $script:internetMessageId = $eml.Fields.Item("urn:schemas:mailheader:message-id").Value
 
             # Get the "upstream-most" SPF
-            if(!($auth = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results-original").Value))
+            if(!($auth = $eml.Fields.Item("urn:schemas:mailheader:authentication-results-original").Value))
             {
-                $auth = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:authentication-results").Value
+                $auth = $eml.Fields.Item("urn:schemas:mailheader:authentication-results").Value
             }
-            $script:authResults = $auth            
-            
-            $script:receivedSPF = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:received-spf").Value
+            $script:authResults = $auth                        
+#            $script:receivedSPF = $itemToAnalyze.Fields.Item("urn:schemas:mailheader:received-spf").Value
+            $script:xOriginatingIp = $eml.Fields.Item("urn:schemas:mailheader:x-originating-ip").Value -replace "\[|\]","" 
 
             foreach($h in $LoggedHeaders)
             {
-                if($val = $itemToAnalyze.Fields.Item(("urn:schemas:mailheader:{0}" -f $h)).Value)
+                if($val = $eml.Fields.Item(("urn:schemas:mailheader:{0}" -f $h)).Value)
                 {
                     $script:additionalHeaders[$h] = $val
                 }
@@ -213,14 +231,18 @@ Function AnalyzeItem($itemToAnalyze)
 $lib = "$PSScriptRoot\microsoft.exchange.webservices.dll"
 Add-Type -Path ($lib) 
 
-if($ConfigFile -eq $null -or $ConfigFile.Trim().Length -eq 0)
+if([string]::IsNullOrWhiteSpace($ConfigFile)) 
 {
-    $ConfigFile = ("{0}.config" -f $MyInvocation.InvocationName)
+    $ConfigFile = ("{0}.config" -f $PSCommandPath )# $MyInvocation.InvocationName)
 }
-$config = Get-Content $ConfigFile | ConvertFrom-Json
+if(!($config = Get-Content $ConfigFile | ConvertFrom-Json))
+{
+    throw "Could not load config from $ConfigFile"
+}
 
 #Connect to Exchange Web Service
 $Service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1)
+
 if($UseImpersonation)
 {
     $Service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $config.mailboxName)
@@ -231,6 +253,20 @@ if($AdminCred -ne $null)
 #    Write-Host ("Connecting to EWS as {0}\{1}" -f $AdminCred.Domain,$AdminCred.UserName)
     $Service.Credentials = $AdminCred
 }
+else  # MSAL
+{
+    $lib = "$PSScriptRoot\Microsoft.Identity.Client.dll"
+    Add-Type -Path ($lib) 
+
+    # https://gsexdev.blogspot.com/2019/10/using-msal-microsoft-authentication.html    
+    $pcaConfig = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($ClientId).WithTenantId($TenantId).WithRedirectUri($redirectUri)
+
+    # can't use "never" if the users hasn't already accepted the prompt.
+    $tokenResult = $pcaConfig.Build().AcquireTokenInteractive($Scopes).WithPrompt([Microsoft.Identity.Client.Prompt]::NoPrompt).WithLoginHint($MailboxName).ExecuteAsync().Result;
+
+    # https://docs.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-authenticate-an-ews-application-by-using-oauth
+    $service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials( $tokenResult.AccessToken)
+}
 
 $Header = @"
 <style>
@@ -239,7 +275,10 @@ TD {border-width: 1px; padding: 3px; border-style: solid; border-color: black;}
 </style>
 "@
 
-$Service.AutodiscoverUrl($config.mailboxName,{$true})
+# Autodiscover doesn't seem to work with my setup.
+# $service.AutodiscoverUrl($config.mailboxName,{$true})
+
+$service.Url = "https://outlook.office365.com/EWS/Exchange.asmx"
 
 #Fetch IDs of Well-known folders
 $RootFolderID = New-object Microsoft.Exchange.WebServices.Data.FolderId([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot, (New-Object Microsoft.Exchange.WebServices.Data.Mailbox( $config.mailboxName)))
@@ -326,8 +365,6 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         "Subject:  {0}" -f $reportedMessage.Subject
         "Sender:  {0}" -f $reportedMessage.From
         "MessageID:  {0}" -f $internetMessageID        
-        Write-Warning  "received-spf:"
-        $receivedSPF -split ";"
         Write-Warning  "Authentication-Results:"
         $authResults -split ";"
 
@@ -482,7 +519,8 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                         if(($recipient = Get-O365Recipient -Identity $msgGroup.Name) -and $recipient.RecipientType -eq "MailUser")
                         {
                             # Use the old-fashioned (and simple) Search-Mailbox cmdlet for each on-prem mailboxes
-                            $result = Search-OnPremMailbox -Identity  $msgGroup.Name -SearchQuery $query  -LogLevel:Full -TargetMailbox $config.mailboxName -TargetFolder $logtoFolder -DeleteContent -Force 
+                            $result = Search-OnPremMailbox -Identity  $msgGroup.Name -SearchQuery $query    -DeleteContent -Force  
+######   logging removed for hybrid topology equivalence  -TargetFolder $logtoFolder -TargetMailbox $config.mailboxName -LogLevel:Full
                             $removed += $result.ResultItemsCount
                         }
                         elseif($recipient.RecipientType -like "*Mailbox")
@@ -527,7 +565,8 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
             RecipientCount=$msgGroupsByRecip.Count
             MessagesRemoved=$removed
             ReportedMessageID=$internetMessageId
-            ReceivedSPF=$receivedSPF
+#            ReceivedSPF=$receivedSPF
+            OriginalIP = $xOriginatingIp
             AuthenticationResults=$authResults
             OriginalReporter=$submission.From.Address
         }
