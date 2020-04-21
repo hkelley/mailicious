@@ -137,6 +137,8 @@ Function AnalyzeItem($itemToAnalyze)
         
         if($eml.SentOn -ne $null)
         {
+            $itemToAnalyze = $eml
+
             $script:reportedMessage = $eml   # this is probably the "root" message
 
             $script:internetMessageId = $eml.Fields.Item("urn:schemas:mailheader:message-id").Value
