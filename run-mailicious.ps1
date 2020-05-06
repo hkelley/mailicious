@@ -259,6 +259,7 @@ else  # MSAL
 {
     $lib = "$PSScriptRoot\Microsoft.Identity.Client.dll"
     Add-Type -Path ($lib) 
+    $upn = (whoami.exe /upn)
 
     # https://gsexdev.blogspot.com/2019/10/using-msal-microsoft-authentication.html 
     $ewsScopes = New-Object System.Collections.Generic.List[string]
@@ -267,7 +268,7 @@ else  # MSAL
     $pcaConfig = [Microsoft.Identity.Client.PublicClientApplicationBuilder]::Create($config.azureClientId).WithTenantId($config.azureTenantId).WithRedirectUri($config.azureRedirectUri)
 
     # can't use "never" if the users hasn't already accepted the prompt.
-    if(!($tokenResult = $pcaConfig.Build().AcquireTokenInteractive($ewsScopes).WithPrompt([Microsoft.Identity.Client.Prompt]::NoPrompt).WithLoginHint($MailboxName).ExecuteAsync().Result))
+    if(!($tokenResult = $pcaConfig.Build().AcquireTokenInteractive($ewsScopes).WithPrompt([Microsoft.Identity.Client.Prompt]::NoPrompt).ExecuteAsync().Result))
     {
         throw "Unable to authenticate to Office 365"
         exit
@@ -519,12 +520,13 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                         $removed += $quarantines.count
                     }
 
+                    # keep the removal search matching the tracing search   #Don't use   subject:`"{0}`" 
+                    $query = "from:{1} received:{2:d}"  -f $traces[0].subject,$traces[0].SenderAddress,[DateTime]::Parse($traces[0].Received)
+                    Write-Verbose $query
+                    $complianceSearchMbxs = @()
+
                     foreach($msgGroup in $msgGroupsByRecip)
                     {  
-                        # keep the removal search matching the tracing search   #Don't use   subject:`"{0}`" 
-                        $query = "from:{1} received:{2:d}"  -f $msgGroup.group[0].subject,$msgGroup.group[0].SenderAddress,[DateTime]::Parse($msgGroup.group[0].Received)
-                        $complianceSearchMbxs = @()
-
                         if(($recipient = Get-O365Recipient -Identity $msgGroup.Name) -and $recipient.RecipientType -eq "MailUser")
                         {
                             # Use the old-fashioned (and simple) Search-Mailbox cmdlet for each on-prem mailboxes
@@ -555,7 +557,17 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
                                    
                         } while(($search = Get-ComplianceSearch -Identity $searchName ) -and $search.Status -ne "Completed")
 
-                        $removed +=  $stats.ExchangeBinding.Search.ContentItems
+                        New-ComplianceSearchAction -SearchName $searchName -Purge -PurgeType SoftDelete -Confirm:$false  | Out-Null
+                        $searchActionName  =  "{0}_purge" -f $searchName   # O365 convention to use the _purge
+                        $searchAction = Get-ComplianceSearchAction -Identity $searchActionName 
+                        do
+                        {
+                            Write-Host ("Purge is {0}" -f $searchAction.Status)
+                            Start-Sleep -Seconds 2
+                                   
+                        } while(($searchAction = Get-ComplianceSearchAction -Identity $searchActionName ) -and $searchAction.Status -ne "Completed")
+                        
+                        $removed +=  $searchAction.NumBindings
                     }
                 }
             }
