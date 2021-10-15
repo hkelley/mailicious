@@ -21,7 +21,7 @@ Function DecodeUrls ($encodedUrls)
     $urls = @{} 
     $encodedUrls | %{$urls[$_] = $_}
 
-    if($ppKeys = $urls.Keys | ?{$_ -like "https://urldefense.com/v3/*"})
+    if($ppKeys = $urls.Keys | ?{$_ -like "https://urldefense.com/v3/*" -or $_ -like "https://urldefense.proofpoint.com/v2/*"})
     {
         $proofpointApiUrl = "https://tap-api-v2.proofpoint.com/v2/url/decode"
     
@@ -73,7 +73,7 @@ Function ExtractLinks($body)
 {
     $foundurls = @()
 
-    foreach($link in [regex]::matches($body, '(www|http:|https:)[^\s^"]+[\w\$]') ) 
+    foreach($link in [regex]::matches($body, '(www|http:|https:)[^\s^"^<]+[\w\$]') ) 
     {
         $link = $link.Value.Trim()
         if( !($foundurls.Contains($link)) -and !($IgnoredURLs.Contains($link)))
@@ -370,7 +370,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
             $reportedMessage = $submission
         }
         
-        ## SPF review by analyst
+        ## Present message metadata for review by analyst
         Write-Warning  "Sender authentication results"
         "Subject:  {0}" -f $reportedMessage.Subject
         "Sender:  {0}" -f $reportedMessage.From
@@ -381,12 +381,10 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
 
         Write-Host ""
 
-        ## URL review by analyst
-        # Analyst picks URLs
+        ## Present URLs for review by analyst
+        ## Analyst may pick one or more URLs to be logged
         if($urls.Count -gt 0)
         {
-            Write-Warning ("URLs found: ")
-
             $urlTable = @()
             for($tableIdx=0; $tableIdx -lt $urls.Count; $tableIdx++) 
             {
@@ -398,7 +396,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
             $urlTable | Format-Table
             $urlTable = $null
 
-            Write-Host "Choose URLs to report and block (enter comma-separated list of index numbers or enter A for all or N for none): " -ForegroundColor Yellow -NoNewline             
+            Write-Host "Choose suspicious URLs to log and block (enter comma-separated list of index numbers or enter A for all or N for none): " -ForegroundColor Yellow -NoNewline             
             $picks =  @((Read-Host).Split(','))
             if($picks -eq "A")
             {
@@ -428,6 +426,32 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         else
         {
             Write-Host "No URLs found`r`n"  -ForegroundColor Yellow
+        }
+
+
+        ## Give the analyst a chance to classify the message or CTRL=C to bail
+
+        $choices = @()
+        for($idxMailClass = 0; $idxMailClass -lt $config.mailClassifications.Count; $idxMailClass++)
+        {
+            $choices += [pscustomobject] @{
+                Option = $idxMailClass
+                Name = $config.mailClassifications[$idxMailClass]
+            } 
+        }
+
+        $choices | ft
+        Write-Host "Choose a category:" -ForegroundColor Yellow -NoNewline             
+        $pick = [int] (Read-Host)
+        
+        if(!($mailClassification = $config.mailClassifications[$pick]))
+        {
+            Write-Warning  "Must select a classification"
+            Exit               
+        }
+        else
+        {
+            Write-Host  "Will classify as $mailClassification"
         }
 
         ## Tracing
@@ -483,8 +507,6 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
 
             if($traces.count -lt 1)
             {
-                $reportedMessage | fl *
-
                 $senderAddr = "#find in authentication header#"
                 $fromIPs = "#find in authentication header#"
             }
@@ -575,6 +597,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
 
         # the object to report
         $summary = [pscustomobject] @{
+            Classification = $mailClassification
             Subject=$reportedMessage.Subject
             FromAddr=$reportedMessage.From #-replace '[^\p{L}\p{Nd}/(/}/_]', ''  # https://lazywinadmin.com/2015/08/powershell-remove-special-characters.html
             ReplyToAddr=$reportedMessage.ReplyTo
@@ -643,7 +666,7 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
     if($config.splunkHECToken -ne $null -and $config.splunkHECToken.trim() -gt "")
     {
         $splunkHeaders = @{Authorization = ("Splunk {0}" -f $config.splunkHECToken)}
-        $splunkHecUrl = "https://{0}/services/collector/event" -f $config.splunkHEC
+        $splunkHecUrl = $config.splunkHECUrl
         $splunkSource = $($MyInvocation.MyCommand).ToString()
 
         # the Splunk payload
