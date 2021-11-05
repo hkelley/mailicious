@@ -226,6 +226,22 @@ Function AnalyzeItem($itemToAnalyze)
     $script:urls += ExtractLinks ($body)
 }
 
+Function ReplyForLegitimateMessage($submittedMessage, $summary)
+{
+    $replyEmail = New-Object  Microsoft.Exchange.WebServices.Data.EmailMessage($Service)
+    $replyEmail.Subject = "[Suspicious Message Review]: `"{0}`"" -f $reportedMessage.subject
+    $replyEmail.ToRecipients.Add($submittedMessage.From)
+    $summaryTable = ConvertTo-Html -InputObject  $summary  -as List -Head $Header
+    $summaryTable = $summaryTable.replace("LINE_BREAK","<p/>")
+    $replyBody  = "This does not appear to be a malicious message.   We have analyzed the content and found the following:<p/><p/>"  + ( $summaryTable)
+    $replyEmail.Body = $replyBody -replace "`0", ""
+    $replyEmail.Save($DraftsFolder )
+
+    $submission.IsRead = $true
+    $submission.Update([Microsoft.Exchange.WebServices.Data.ConflictResolutionMode]::AutoResolve)
+}
+
+
 # Load cmdlets needed for Exchange on-prem and O365 interaction
 & $PSScriptRoot\Import-Exchange-Cmdlets.ps1
 
@@ -396,7 +412,8 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
             $urlTable | Format-Table
             $urlTable = $null
 
-            Write-Host "Choose suspicious URLs to log and block (enter comma-separated list of index numbers or enter A for all or N for none): " -ForegroundColor Yellow -NoNewline             
+            Write-Host "Choose suspicious URLs to log and block (enter comma-separated list of index numbers or enter A for all or N for none) " -ForegroundColor Yellow -NoNewline             
+            Write-Host "  or enter R to reply to the user (if you believe the message is non-malicious): " -ForegroundColor Yellow -NoNewline             
             $picks =  @((Read-Host).Split(','))
             if($picks -eq "A")
             {
@@ -406,6 +423,21 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
             {
                 $urls = @()
                 # take none
+            }
+            elseif($picks -eq "R")
+            {
+
+                $summary = [pscustomobject] @{
+                    Subject=$reportedMessage.Subject
+                    FromAddr=$reportedMessage.From #-replace '[^\p{L}\p{Nd}/(/}/_]', ''  # https://lazywinadmin.com/2015/08/powershell-remove-special-characters.html
+                    ReplyToAddr=$reportedMessage.ReplyTo
+                    AuthenticationResults=$authResults
+                    ReportedMessageID=$internetMessageId
+                    URLs=($urls -join "LINE_BREAK" ) -replace "http","hXXp"
+                }
+
+                ReplyForLegitimateMessage -submittedMessage $submission -summary $summary
+                Exit
             }
             else
             {
@@ -441,9 +473,24 @@ $itemView.OrderBy.Add([Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTime
         }
 
         $choices | ft
-        Write-Host "Choose a category:" -ForegroundColor Yellow -NoNewline             
+        Write-Host "Choose a category or type 9 for legitimate email:" -ForegroundColor Yellow -NoNewline             
         $pick = [int] (Read-Host)
         
+        if($pick -gt $choices.length)
+        {
+
+            $summary = [pscustomobject] @{
+                Subject=$reportedMessage.Subject
+                FromAddr=$reportedMessage.From #-replace '[^\p{L}\p{Nd}/(/}/_]', ''  # https://lazywinadmin.com/2015/08/powershell-remove-special-characters.html
+                ReplyToAddr=$reportedMessage.ReplyTo
+                AuthenticationResults=$authResults
+                ReportedMessageID=$internetMessageId
+            }
+
+            ReplyForLegitimateMessage -submittedMessage $submission -summary $summary
+            Exit
+        }
+
         if(!($mailClassification = $config.mailClassifications[$pick]))
         {
             Write-Warning  "Must select a classification"
